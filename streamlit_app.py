@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
-from research_core import search_literature, build_context, source_markdown
+from research_core import search_literature, build_context, source_markdown, check_openalex_connection
 
 st.set_page_config(
     page_title="GeoResearch AI — Pre-2021 Liquefaction & Ground Improvement",
@@ -22,6 +22,28 @@ with st.sidebar:
     max_results = st.slider("Candidate papers", 20, 120, 60, 10)
     top_k = st.slider("Evidence sources sent to AI", 4, 20, 10, 1)
     include_no_abstract = st.checkbox("Show records without abstracts", value=False)
+    st.markdown("---")
+    st.subheader("OpenAlex connection")
+    _oa_key = None
+    try:
+        _oa_key = st.secrets.get("OPENALEX_API_KEY")
+    except Exception:
+        pass
+    _oa_key = _oa_key or os.getenv("OPENALEX_API_KEY")
+    if st.button("Test OpenAlex connection", use_container_width=True):
+        if not _oa_key:
+            st.error("OPENALEX_API_KEY is not configured in Streamlit Secrets.")
+        else:
+            try:
+                status = check_openalex_connection(_oa_key)
+                remaining = status.get("remaining")
+                limit = status.get("limit")
+                if remaining is not None and limit is not None:
+                    st.success(f"OpenAlex connected. Daily budget remaining: {remaining} / {limit}.")
+                else:
+                    st.success("OpenAlex connected successfully.")
+            except Exception as exc:
+                st.error(str(exc))
     st.markdown("---")
     st.markdown(
         "**Scope**\n\n"

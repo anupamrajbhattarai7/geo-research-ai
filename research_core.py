@@ -17,7 +17,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 OPENALEX_WORKS = "https://api.openalex.org/works"
-CUTOFF_DATE = "2020-12-31"
+OPENALEX_RATE_LIMIT = "https://api.openalex.org/rate-limit"
+CUTOFF_YEAR = 2020
 
 DOMAIN_TERMS = [
     "soil liquefaction",
@@ -42,6 +43,61 @@ DOMAIN_TERMS = [
     "biocementation liquefaction",
     "colloidal silica liquefaction",
 ]
+
+
+class OpenAlexError(RuntimeError):
+    """Friendly OpenAlex error that never exposes credentials."""
+
+
+def _headers(api_key: str | None = None) -> Dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "GeoResearchAI/0.3 (research-literature-assistant)",
+    }
+    if api_key:
+        # Send the key in an Authorization header so it never appears in URLs,
+        # browser history, or Streamlit exception messages.
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    return headers
+
+
+def _error_message(resp: requests.Response) -> str:
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict):
+            msg = payload.get("message") or payload.get("error")
+            if msg:
+                return str(msg)
+            validation = payload.get("validation")
+            if isinstance(validation, dict):
+                errors = validation.get("errors") or []
+                if errors and isinstance(errors[0], dict):
+                    return str(errors[0].get("message") or "Invalid OpenAlex request")
+    except Exception:
+        pass
+    text = (resp.text or "").strip().replace("\n", " ")
+    return text[:300] if text else f"HTTP {resp.status_code}"
+
+
+def check_openalex_connection(api_key: str | None = None) -> Dict:
+    api_key = (api_key or os.getenv("OPENALEX_API_KEY") or "").strip() or None
+    try:
+        resp = requests.get(OPENALEX_RATE_LIMIT, headers=_headers(api_key), timeout=20)
+    except requests.RequestException as exc:
+        raise OpenAlexError(f"Could not reach OpenAlex: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise OpenAlexError(
+            f"OpenAlex connection test failed (HTTP {resp.status_code}): {_error_message(resp)}"
+        )
+
+    data = resp.json() if resp.content else {}
+    return {
+        "remaining": resp.headers.get("X-RateLimit-Remaining"),
+        "limit": resp.headers.get("X-RateLimit-Limit"),
+        "reset": resp.headers.get("X-RateLimit-Reset"),
+        "data": data,
+    }
 
 
 def reconstruct_abstract(inverted_index: Dict | None) -> str:
@@ -127,38 +183,84 @@ def _query_terms(question: str, max_terms: int = 3) -> List[str]:
     return terms[:max_terms]
 
 
+def _clean_search(text: str) -> str:
+    # OpenAlex accepts natural-language search. Removing punctuation gives us a
+    # safe fallback if an upstream parser rejects a question-style query.
+    cleaned = re.sub(r"[^\w\s\-\"]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _fetch_openalex(search: str, per_page: int, api_key: str | None = None) -> List[Dict]:
-    params = {
+    base_params = {
         "search": search,
-        "filter": f"to_publication_date:{CUTOFF_DATE}",
+        "filter": f"publication_year:<{CUTOFF_YEAR + 1}",
         "per_page": min(max(per_page, 1), 100),
-        "sort": "relevance_score:desc",
+        "sort": "-relevance_score",
     }
-    if api_key:
-        params["api_key"] = api_key
+
+    # First try the full natural-language query. On HTTP 400 only, retry a
+    # punctuation-free query without an explicit sort. This makes the app more
+    # tolerant of upstream query-parser changes while preserving accuracy.
+    variants = [
+        base_params,
+        {
+            "search": _clean_search(search),
+            "filter": f"publication_year:<{CUTOFF_YEAR + 1}",
+            "per_page": min(max(per_page, 1), 100),
+        },
+    ]
 
     last_response = None
-    for attempt in range(5):
-        resp = requests.get(OPENALEX_WORKS, params=params, timeout=30)
-        last_response = resp
-
-        if resp.status_code == 200:
-            return resp.json().get("results", [])
-
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
+    for variant_idx, params in enumerate(variants):
+        for attempt in range(5):
             try:
-                wait_seconds = float(retry_after) if retry_after else 2 ** attempt
-            except ValueError:
-                wait_seconds = 2 ** attempt
-            time.sleep(min(max(wait_seconds, 1), 16))
-            continue
+                resp = requests.get(
+                    OPENALEX_WORKS,
+                    params=params,
+                    headers=_headers(api_key),
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                if attempt < 4:
+                    time.sleep(min(2 ** attempt, 16))
+                    continue
+                raise OpenAlexError(f"Could not reach OpenAlex: {exc}") from exc
 
-        if resp.status_code >= 500:
-            time.sleep(min(2 ** attempt, 16))
-            continue
+            last_response = resp
+            if resp.status_code == 200:
+                return resp.json().get("results", [])
 
-        resp.raise_for_status()
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait_seconds = float(retry_after) if retry_after else 2 ** attempt
+                except ValueError:
+                    wait_seconds = 2 ** attempt
+                time.sleep(min(max(wait_seconds, 1), 16))
+                continue
+
+            if resp.status_code >= 500:
+                time.sleep(min(2 ** attempt, 16))
+                continue
+
+            if resp.status_code == 400 and variant_idx == 0:
+                # Try the simplified request once before surfacing the upstream message.
+                break
+
+            if resp.status_code in (401, 403):
+                raise OpenAlexError(
+                    "OpenAlex rejected the API key. Rotate/copy the key again in OpenAlex, "
+                    "then replace OPENALEX_API_KEY in Streamlit Secrets."
+                )
+
+            raise OpenAlexError(
+                f"OpenAlex rejected the search (HTTP {resp.status_code}): {_error_message(resp)}"
+            )
+
+    if last_response is not None and last_response.status_code == 400:
+        raise OpenAlexError(
+            f"OpenAlex rejected the search (HTTP 400): {_error_message(last_response)}"
+        )
 
     remaining = last_response.headers.get("X-RateLimit-Remaining") if last_response is not None else None
     reset = last_response.headers.get("X-RateLimit-Reset") if last_response is not None else None
@@ -168,28 +270,25 @@ def _fetch_openalex(search: str, per_page: int, api_key: str | None = None) -> L
     if reset is not None:
         details.append(f"reset_seconds={reset}")
     suffix = f" ({', '.join(details)})" if details else ""
-    raise RuntimeError(
-        "OpenAlex rate limit reached after retries. Add a free OPENALEX_API_KEY in Streamlit Secrets "
-        "or wait for the OpenAlex daily budget to reset." + suffix
+    raise OpenAlexError(
+        "OpenAlex rate limit reached after retries. Check your OPENALEX_API_KEY or wait for the daily budget to reset."
+        + suffix
     )
 
 
 def search_literature(question: str, max_results: int = 60, api_key: str | None = None) -> List[Dict]:
     """Search, deduplicate, filter, and rank pre-2021 literature."""
-    api_key = api_key or os.getenv("OPENALEX_API_KEY")
+    api_key = (api_key or os.getenv("OPENALEX_API_KEY") or "").strip() or None
     terms = _query_terms(question)
 
-    # OpenAlex charges per search request, not per result. Pulling up to 100 results
-    # per query is therefore more efficient than issuing many small requests.
     per_query = 100
-
     by_id: Dict[str, Dict] = {}
     for term in terms:
         for raw in _fetch_openalex(term, per_page=per_query, api_key=api_key):
             item = normalize_work(raw)
             if item["is_retracted"]:
                 continue
-            if item.get("year") and item["year"] > 2020:
+            if item.get("year") and item["year"] > CUTOFF_YEAR:
                 continue
             key = item["id"] or item["doi"] or item["title"].lower()
             if key not in by_id:
