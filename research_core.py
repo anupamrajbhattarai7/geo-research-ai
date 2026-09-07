@@ -1,15 +1,16 @@
 """Core retrieval utilities for GeoResearch AI.
 
-The app deliberately retrieves bibliographic metadata and available abstracts rather
-than redistributing copyrighted full-text articles.
+The app retrieves bibliographic metadata and available abstracts from OpenAlex
+rather than redistributing copyrighted full-text articles.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import re
-from collections import defaultdict
-from typing import Dict, Iterable, List
+import time
+from typing import Dict, List
 
 import requests
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -44,7 +45,6 @@ DOMAIN_TERMS = [
 
 
 def reconstruct_abstract(inverted_index: Dict | None) -> str:
-    """Convert OpenAlex's abstract inverted index to readable text."""
     if not inverted_index:
         return ""
     positions = []
@@ -92,8 +92,8 @@ def normalize_work(work: Dict) -> Dict:
     }
 
 
-def _query_terms(question: str, max_terms: int = 5) -> List[str]:
-    """Create a small set of high-recall domain searches from the user's question."""
+def _query_terms(question: str, max_terms: int = 3) -> List[str]:
+    """Create a small number of high-recall searches to limit API usage."""
     q = question.strip()
     q_lower = q.lower()
     terms = [q]
@@ -112,12 +112,11 @@ def _query_terms(question: str, max_terms: int = 5) -> List[str]:
         if len(terms) >= max_terms:
             break
 
-    # Safety-net searches for domain coverage when the question has unusual wording.
     if len(terms) < max_terms:
         if "liquef" in q_lower:
-            extras = ["soil liquefaction", "liquefaction mitigation", "liquefaction triggering"]
+            extras = ["soil liquefaction", "liquefaction mitigation"]
         elif any(x in q_lower for x in ["improvement", "grout", "column", "mixing", "compaction", "drain"]):
-            extras = ["ground improvement", "liquefaction mitigation", "soil improvement seismic"]
+            extras = ["ground improvement", "liquefaction mitigation"]
         else:
             extras = ["soil liquefaction", "ground improvement"]
         for term in extras:
@@ -128,33 +127,65 @@ def _query_terms(question: str, max_terms: int = 5) -> List[str]:
     return terms[:max_terms]
 
 
-def _fetch_openalex(search: str, per_page: int, mailto: str | None = None) -> List[Dict]:
+def _fetch_openalex(search: str, per_page: int, api_key: str | None = None) -> List[Dict]:
     params = {
         "search": search,
         "filter": f"to_publication_date:{CUTOFF_DATE}",
-        "per-page": min(per_page, 100),
+        "per_page": min(max(per_page, 1), 100),
         "sort": "relevance_score:desc",
     }
-    if mailto:
-        params["mailto"] = mailto
-    resp = requests.get(OPENALEX_WORKS, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("results", [])
+    if api_key:
+        params["api_key"] = api_key
+
+    last_response = None
+    for attempt in range(5):
+        resp = requests.get(OPENALEX_WORKS, params=params, timeout=30)
+        last_response = resp
+
+        if resp.status_code == 200:
+            return resp.json().get("results", [])
+
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait_seconds = float(retry_after) if retry_after else 2 ** attempt
+            except ValueError:
+                wait_seconds = 2 ** attempt
+            time.sleep(min(max(wait_seconds, 1), 16))
+            continue
+
+        if resp.status_code >= 500:
+            time.sleep(min(2 ** attempt, 16))
+            continue
+
+        resp.raise_for_status()
+
+    remaining = last_response.headers.get("X-RateLimit-Remaining") if last_response is not None else None
+    reset = last_response.headers.get("X-RateLimit-Reset") if last_response is not None else None
+    details = []
+    if remaining is not None:
+        details.append(f"remaining={remaining}")
+    if reset is not None:
+        details.append(f"reset_seconds={reset}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    raise RuntimeError(
+        "OpenAlex rate limit reached after retries. Add a free OPENALEX_API_KEY in Streamlit Secrets "
+        "or wait for the OpenAlex daily budget to reset." + suffix
+    )
 
 
-def search_literature(question: str, max_results: int = 60) -> List[Dict]:
-    """Search, deduplicate, filter, and rank pre-2021 literature.
-
-    Ranking is intentionally transparent: TF-IDF similarity to the question plus a
-    small log-scaled citation prior. Retracted works are excluded.
-    """
-    mailto = os.getenv("OPENALEX_MAILTO")
+def search_literature(question: str, max_results: int = 60, api_key: str | None = None) -> List[Dict]:
+    """Search, deduplicate, filter, and rank pre-2021 literature."""
+    api_key = api_key or os.getenv("OPENALEX_API_KEY")
     terms = _query_terms(question)
-    per_query = max(20, min(60, (max_results * 2) // max(1, len(terms))))
+
+    # OpenAlex charges per search request, not per result. Pulling up to 100 results
+    # per query is therefore more efficient than issuing many small requests.
+    per_query = 100
 
     by_id: Dict[str, Dict] = {}
     for term in terms:
-        for raw in _fetch_openalex(term, per_page=per_query, mailto=mailto):
+        for raw in _fetch_openalex(term, per_page=per_query, api_key=api_key):
             item = normalize_work(raw)
             if item["is_retracted"]:
                 continue
@@ -176,14 +207,11 @@ def search_literature(question: str, max_results: int = 60) -> List[Dict]:
     except ValueError:
         semantic = [0.0] * len(items)
 
-    import math
-
     max_cites = max((x["cited_by_count"] for x in items), default=0)
     denom = math.log1p(max_cites) or 1.0
     for idx, item in enumerate(items):
         citation_prior = math.log1p(item["cited_by_count"]) / denom
         has_abstract = 1.0 if item["abstract"] else 0.0
-        # Relevance dominates. Citation count acts only as a tie-breaker-like prior.
         item["score"] = float(0.82 * semantic[idx] + 0.13 * citation_prior + 0.05 * has_abstract)
 
     items.sort(key=lambda x: (x["score"], x["cited_by_count"]), reverse=True)

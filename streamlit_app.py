@@ -63,9 +63,22 @@ if run:
         st.warning("Enter a research question first.")
         st.stop()
 
+    openalex_api_key = None
+    try:
+        openalex_api_key = st.secrets.get("OPENALEX_API_KEY")
+    except Exception:
+        pass
+    openalex_api_key = openalex_api_key or os.getenv("OPENALEX_API_KEY")
+
+    if not openalex_api_key:
+        st.warning(
+            "No OpenAlex API key is configured. Anonymous OpenAlex usage has a small shared daily budget and may return HTTP 429. "
+            "Add OPENALEX_API_KEY in Streamlit Secrets for reliable searching."
+        )
+
     with st.spinner("Searching pre-2021 scholarly literature..."):
         try:
-            results = search_literature(question, max_results=max_results)
+            results = search_literature(question, max_results=max_results, api_key=openalex_api_key)
         except Exception as exc:
             st.error(f"Literature search failed: {exc}")
             st.stop()
