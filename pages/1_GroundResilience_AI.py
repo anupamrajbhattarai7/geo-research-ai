@@ -50,7 +50,6 @@ def find_database():
 
 @st.cache_data
 def load_database():
-
     path = find_database()
 
     if path is None:
@@ -75,7 +74,7 @@ def load_database():
         if column not in df.columns:
             df[column] = ""
 
-    text_columns = [
+    for column in [
         "title",
         "authors",
         "source",
@@ -84,9 +83,7 @@ def load_database():
         "landing_page",
         "pdf_url",
         "matched_topic",
-    ]
-
-    for column in text_columns:
+    ]:
         df[column] = df[column].fillna("").astype(str)
 
     df["year"] = pd.to_numeric(
@@ -99,16 +96,16 @@ def load_database():
         errors="coerce",
     ).fillna(0).astype(int)
 
-    # Strict pre-2021 cutoff
     df = df[
         (df["year"] > 0)
         & (df["year"] <= 2020)
     ].copy()
 
-    if "papers.csv" in path.name:
-        database_name = "Full research corpus"
-    else:
-        database_name = "Starter dataset"
+    database_name = (
+        "Full research corpus"
+        if path.name == "papers.csv"
+        else "Starter dataset"
+    )
 
     return df, database_name
 
@@ -125,6 +122,8 @@ if df is None:
 # ============================================================
 
 def search_papers(dataframe, question, top_k=15):
+    if dataframe.empty:
+        return dataframe
 
     search_text = (
         dataframe["title"]
@@ -132,6 +131,8 @@ def search_papers(dataframe, question, top_k=15):
         + dataframe["abstract"]
         + ". "
         + dataframe["matched_topic"]
+        + ". "
+        + dataframe["source"]
     )
 
     vectorizer = TfidfVectorizer(
@@ -142,10 +143,7 @@ def search_papers(dataframe, question, top_k=15):
     )
 
     paper_vectors = vectorizer.fit_transform(search_text)
-
-    question_vector = vectorizer.transform(
-        [question]
-    )
+    question_vector = vectorizer.transform([question])
 
     scores = cosine_similarity(
         question_vector,
@@ -153,75 +151,85 @@ def search_papers(dataframe, question, top_k=15):
     ).ravel()
 
     results = dataframe.copy()
-
     results["score"] = scores
 
-    # Prefer papers that actually contain an abstract
     results["abstract_bonus"] = results["abstract"].apply(
-        lambda text: 0.05
-        if len(text.strip()) >= 150
-        else 0
+        lambda text: 0.05 if len(text.strip()) >= 150 else 0.0
     )
+
+    question_terms = set(
+        re.findall(
+            r"[A-Za-z][A-Za-z\-]{3,}",
+            question.lower(),
+        )
+    )
+
+    def title_bonus(title):
+        title_terms = set(
+            re.findall(
+                r"[A-Za-z][A-Za-z\-]{3,}",
+                title.lower(),
+            )
+        )
+
+        if not question_terms:
+            return 0.0
+
+        overlap = len(question_terms & title_terms) / len(question_terms)
+        return min(0.06, overlap * 0.06)
+
+    results["title_bonus"] = results["title"].apply(title_bonus)
 
     results["final_score"] = (
         results["score"]
         + results["abstract_bonus"]
+        + results["title_bonus"]
     )
 
-    results = results.sort_values(
-        [
-            "final_score",
-            "cited_by_count",
-        ],
-        ascending=[
-            False,
-            False,
-        ],
-    )
-
-    return results.head(top_k)
+    return results.sort_values(
+        ["final_score", "cited_by_count"],
+        ascending=[False, False],
+    ).head(top_k)
 
 
 # ============================================================
-# GEMINI
+# GEMINI SETTINGS
 # ============================================================
+
+def get_secret(name, default=""):
+    try:
+        value = st.secrets[name]
+        if value is not None:
+            return str(value).strip()
+    except Exception:
+        pass
+
+    return os.getenv(name, default).strip()
+
 
 def get_gemini_key():
-
-    try:
-        return str(
-            st.secrets["GEMINI_API_KEY"]
-        ).strip()
-
-    except Exception:
-        return os.getenv(
-            "GEMINI_API_KEY",
-            "",
-        ).strip()
+    return get_secret("GEMINI_API_KEY")
 
 
 def get_gemini_model():
-
-    try:
-        return str(
-            st.secrets["GEMINI_MODEL"]
-        ).strip()
-
-    except Exception:
-        return "gemini-2.5-flash"
+    return get_secret(
+        "GEMINI_MODEL",
+        "gemini-3.8-flash",
+    )
 
 
 def paper_url(row):
-
     if row["doi"]:
         return f"https://doi.org/{row['doi']}"
 
     return row["landing_page"]
 
 
-def build_evidence(results, max_sources=8):
+# ============================================================
+# EVIDENCE PACKET
+# ============================================================
 
-    # Only send papers that actually contain useful abstracts
+def build_evidence(results, max_sources=10):
     usable = results[
         results["abstract"].str.len() >= 150
     ].head(max_sources)
@@ -232,11 +240,9 @@ def build_evidence(results, max_sources=8):
         usable.iterrows(),
         start=1,
     ):
-
         evidence_blocks.append(
             f"""
 SOURCE [{number}]
-
 Title: {paper['title']}
 Authors: {paper['authors']}
 Year: {paper['year']}
@@ -248,65 +254,103 @@ Abstract:
 """
         )
 
-    evidence_text = "\n".join(
-        evidence_blocks
-    )
+    return usable, "\n".join(evidence_blocks)
 
-    return usable, evidence_text
 
+# ============================================================
+# 300-WORD GEMINI PROMPT
+# ============================================================
 
 SYSTEM_PROMPT = """
-You are GroundResilience AI.
+You are GroundResilience AI, a technical research assistant specializing
+equally in soil liquefaction and ground improvement.
 
-You are a technical research assistant specializing equally in:
+Use ONLY the research evidence supplied to you.
 
-1. soil liquefaction; and
-2. ground improvement.
-
-Use ONLY the research evidence provided to you.
-
-Rules:
+STRICT RULES:
 
 - Do not use outside knowledge.
-- Do not invent findings.
-- Do not invent numerical values.
-- Do not invent citations.
-- Do not invent mechanisms that are not stated in the evidence.
-- Cite every important technical statement using [1], [2], etc.
-- Use only source numbers supplied in the evidence.
-- If evidence is insufficient, say so.
-- Clearly distinguish reported findings from your synthesis.
-- Discuss limitations when they are present.
+- Do not invent findings, numbers, mechanisms, authors, or citations.
+- Cite every important technical claim using supplied source numbers
+  such as [1], [2], or [2][4].
+- Cite only source numbers present in the supplied evidence.
+- Clearly distinguish reported findings from synthesis.
+- If the retrieved evidence is insufficient, state that clearly.
+- Give ground improvement and liquefaction equal importance when relevant.
 - Do not provide site-specific engineering design recommendations.
+- Do not claim that this database contains every paper ever published.
 
-Use this format:
+LENGTH:
+- The COMPLETE response must be 300 words or fewer.
+- Aim for approximately 220-280 words.
+- Be information-dense rather than repetitive.
+
+FORMAT:
 
 ### Direct answer
+Answer the research question directly.
 
-### Ground-improvement evidence
+### Key evidence
+Summarize the most important ground-improvement methods and
+liquefaction-related findings supported by the retrieved studies.
 
-### Liquefaction implications
+### Limitations
+Briefly identify important limitations, disagreements, or evidence gaps.
 
-### Limitations and evidence gaps
+Use citations throughout the response.
 """
 
 
-def ask_gemini(question, results):
+def limit_to_300_words(text):
+    words = text.split()
 
+    if len(words) <= 300:
+        return text
+
+    shortened = " ".join(words[:300])
+
+    if shortened.count("[") > shortened.count("]"):
+        last_open = shortened.rfind("[")
+        if last_open > 0:
+            shortened = shortened[:last_open].rstrip()
+
+    return shortened + " …"
+
+
+def validate_citations(answer, source_count):
+    citations = {
+        int(number)
+        for number in re.findall(
+            r"\[(\d+)\]",
+            answer or "",
+        )
+    }
+
+    invalid = {
+        number
+        for number in citations
+        if number < 1 or number > source_count
+    }
+
+    return invalid
+
+
+def ask_gemini(question, results):
     api_key = get_gemini_key()
 
     if not api_key:
         return None, None, "Gemini API key not configured."
 
     sources, evidence = build_evidence(
-        results
+        results,
+        max_sources=10,
     )
 
     if len(sources) < 2:
         return (
             None,
             sources,
-            "Not enough papers contain abstracts "
+            "Not enough retrieved papers contain abstracts "
             "for a reliable Gemini answer.",
         )
 
@@ -315,17 +359,15 @@ RESEARCH QUESTION:
 
 {question}
 
-
 RETRIEVED PRE-2021 RESEARCH:
 
 {evidence}
 
-
-Answer the question using only the research above.
+Prepare a technical answer using ONLY the evidence above.
+The entire answer must be no more than 300 words.
 """
 
     try:
-
         client = genai.Client(
             api_key=api_key
         )
@@ -336,7 +378,7 @@ Answer the question using only the research above.
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0.2,
-                max_output_tokens=1200,
+                max_output_tokens=750,
             ),
         )
 
@@ -351,33 +393,24 @@ Answer the question using only the research above.
                 "Gemini returned no answer.",
             )
 
-        # Check that Gemini did not invent citation numbers
-        citations = {
-            int(number)
-            for number in re.findall(
-                r"\[(\d+)\]",
-                answer,
-            )
-        }
+        answer = limit_to_300_words(answer)
 
-        invalid_citations = [
-            number
-            for number in citations
-            if number > len(sources)
-        ]
+        invalid_citations = validate_citations(
+            answer,
+            len(sources),
+        )
 
         if invalid_citations:
             return (
                 None,
                 sources,
-                "Gemini generated invalid citations. "
+                "Gemini generated invalid citation numbers. "
                 "The answer was withheld.",
             )
 
         return answer, sources, None
 
     except Exception as error:
-
         return (
             None,
             sources,
@@ -389,12 +422,10 @@ Answer the question using only the research above.
 # FREE LOCAL FALLBACK
 # ============================================================
 
-def local_summary(question, results):
-
+def local_summary(question, results, max_sentences=6):
     evidence_sentences = []
 
     for _, paper in results.iterrows():
-
         abstract = paper["abstract"]
 
         if not abstract:
@@ -406,6 +437,7 @@ def local_summary(question, results):
         )
 
         for sentence in sentences:
+            sentence = sentence.strip()
 
             if len(sentence) < 40:
                 continue
@@ -430,6 +462,7 @@ def local_summary(question, results):
     vectorizer = TfidfVectorizer(
         stop_words="english",
         ngram_range=(1, 2),
+        sublinear_tf=True,
     )
 
     sentence_vectors = vectorizer.fit_transform(
@@ -449,7 +482,7 @@ def local_summary(question, results):
         evidence_sentences,
         scores,
     ):
-        item["score"] = score
+        item["score"] = float(score)
 
     evidence_sentences.sort(
         key=lambda item: item["score"],
@@ -460,17 +493,13 @@ def local_summary(question, results):
     used_papers = set()
 
     for item in evidence_sentences:
-
         if item["title"] in used_papers:
             continue
 
         output.append(item)
+        used_papers.add(item["title"])
 
-        used_papers.add(
-            item["title"]
-        )
-
-        if len(output) == 6:
+        if len(output) >= max_sentences:
             break
 
     return output
@@ -481,10 +510,7 @@ def local_summary(question, results):
 # ============================================================
 
 with st.sidebar:
-
-    st.header(
-        "Research Database"
-    )
+    st.header("Research Database")
 
     st.metric(
         "Indexed papers",
@@ -497,8 +523,7 @@ with st.sidebar:
     )
 
     st.write(
-        f"**Database:** "
-        f"{database_name}"
+        f"**Database:** {database_name}"
     )
 
     focus = st.selectbox(
@@ -516,35 +541,33 @@ with st.sidebar:
         min_value=1900,
         max_value=2020,
         value=1980,
+        step=1,
     )
 
     number_results = st.slider(
         "Number of retrieved papers",
-        8,
-        25,
-        15,
+        min_value=8,
+        max_value=25,
+        value=15,
     )
 
     st.divider()
 
     if get_gemini_key():
-
         st.success(
-            f"Gemini enabled: "
-            f"{get_gemini_model()}"
+            f"Gemini enabled: {get_gemini_model()}"
         )
 
         st.caption(
-            "If Gemini is unavailable, "
-            "free local evidence extraction "
-            "will be used automatically."
+            "Gemini receives only retrieved research evidence. "
+            "If Gemini is unavailable, free local evidence extraction "
+            "is used automatically."
         )
 
     else:
-
         st.info(
             "Gemini not configured. "
-            "Free local search will still work."
+            "Free local evidence extraction will still work."
         )
 
 
@@ -558,7 +581,6 @@ filtered_df = df[
 
 
 if focus == "Liquefaction":
-
     filtered_df = filtered_df[
         filtered_df["title"].str.contains(
             "liquefaction",
@@ -571,13 +593,18 @@ if focus == "Liquefaction":
             case=False,
             na=False,
         )
+        |
+        filtered_df["matched_topic"].str.contains(
+            "liquefaction",
+            case=False,
+            na=False,
+        )
     ]
 
 
 elif focus == "Ground Improvement":
-
     terms = (
-        "ground improvement|grout|"
+        "ground improvement|grout|grouting|"
         "stone column|deep mixing|"
         "vibro|compaction|stabilization|drain"
     )
@@ -596,11 +623,17 @@ elif focus == "Ground Improvement":
             na=False,
             regex=True,
         )
+        |
+        filtered_df["matched_topic"].str.contains(
+            terms,
+            case=False,
+            na=False,
+            regex=True,
+        )
     ]
 
 
 elif focus == "Colloidal Silica":
-
     filtered_df = filtered_df[
         filtered_df["title"].str.contains(
             "colloidal silica",
@@ -609,6 +642,12 @@ elif focus == "Colloidal Silica":
         )
         |
         filtered_df["abstract"].str.contains(
+            "colloidal silica",
+            case=False,
+            na=False,
+        )
+        |
+        filtered_df["matched_topic"].str.contains(
             "colloidal silica",
             case=False,
             na=False,
@@ -623,9 +662,8 @@ elif focus == "Colloidal Silica":
 question = st.text_area(
     "Ask a research question",
     value=(
-        "What ground improvement methods "
-        "have been used to mitigate liquefaction, "
-        "and what limitations are reported?"
+        "What ground improvement methods have been used "
+        "to mitigate liquefaction, and what limitations are reported?"
     ),
     height=90,
 )
@@ -635,10 +673,15 @@ if st.button(
     "Search + Generate Research Answer",
     type="primary",
 ):
-
     if not question.strip():
         st.warning(
             "Please enter a research question."
+        )
+        st.stop()
+
+    if filtered_df.empty:
+        st.warning(
+            "No papers match the selected filters."
         )
         st.stop()
 
@@ -648,36 +691,31 @@ if st.button(
         number_results,
     )
 
-
-    # ========================================================
-    # GEMINI ANSWER
-    # ========================================================
-
     answer = None
     sources = None
     error = None
 
     if get_gemini_key():
-
         with st.spinner(
             "Gemini is reading the retrieved research..."
         ):
-
             answer, sources, error = ask_gemini(
                 question,
                 results,
             )
 
-
     st.subheader(
         "Research Answer"
     )
 
-
     if answer:
-
         st.markdown(
             answer
+        )
+
+        st.caption(
+            f"Answer length: {len(answer.split())} words "
+            "(maximum 300)."
         )
 
         st.markdown(
@@ -688,21 +726,23 @@ if st.button(
             sources.iterrows(),
             start=1,
         ):
+            url = paper_url(paper)
 
-            st.markdown(
-                f"[{number}] "
-                f"{paper['title']} "
-                f"({paper['year']})  \n"
-                f"{paper_url(paper)}"
-            )
-
-
-    # ========================================================
-    # FREE FALLBACK
-    # ========================================================
+            if url:
+                st.markdown(
+                    f"- [{number}] "
+                    f"{paper['title']} "
+                    f"({paper['year']}) — "
+                    f"{url}"
+                )
+            else:
+                st.markdown(
+                    f"- [{number}] "
+                    f"{paper['title']} "
+                    f"({paper['year']})"
+                )
 
     else:
-
         if error:
             st.warning(
                 error
@@ -717,20 +757,28 @@ if st.button(
             results,
         )
 
+        if not evidence:
+            st.info(
+                "The retrieved records do not contain enough "
+                "abstract evidence to summarize."
+            )
+
         for item in evidence:
+            source_label = (
+                f"{item['title']} "
+                f"({item['year']})"
+            )
+
+            if item["url"]:
+                source_label = (
+                    f"[{source_label}]"
+                    f"({item['url']})"
+                )
 
             st.markdown(
                 f"- {item['sentence']}  \n"
-                f"  **Source:** "
-                f"[{item['title']} "
-                f"({item['year']})]"
-                f"({item['url']})"
+                f"  **Source:** {source_label}"
             )
-
-
-    # ========================================================
-    # PAPER LIST
-    # ========================================================
 
     st.divider()
 
@@ -738,28 +786,23 @@ if st.button(
         "Most Relevant Pre-2021 Research"
     )
 
-
     for rank, (_, paper) in enumerate(
         results.iterrows(),
         start=1,
     ):
-
         with st.expander(
             f"{rank}. "
             f"{paper['title']} "
             f"({paper['year']})",
             expanded=(rank <= 3),
         ):
-
             if paper["authors"]:
-
                 st.write(
                     f"**Authors:** "
                     f"{paper['authors']}"
                 )
 
             if paper["source"]:
-
                 st.write(
                     f"**Publication:** "
                     f"{paper['source']}"
@@ -776,21 +819,37 @@ if st.button(
             )
 
             if paper["doi"]:
-
                 st.markdown(
                     f"**DOI:** "
                     f"https://doi.org/"
                     f"{paper['doi']}"
                 )
 
-            if paper["abstract"]:
+            if paper["landing_page"]:
+                st.markdown(
+                    f"**Research record:** "
+                    f"{paper['landing_page']}"
+                )
 
+            if paper["pdf_url"]:
+                st.markdown(
+                    f"**Open-access PDF:** "
+                    f"{paper['pdf_url']}"
+                )
+
+            if paper["abstract"]:
                 st.write(
                     "**Abstract**"
                 )
 
                 st.write(
                     paper["abstract"]
+                )
+
+            else:
+                st.caption(
+                    "Abstract not available "
+                    "in the current record."
                 )
 
 
@@ -800,8 +859,30 @@ if st.button(
 
 st.divider()
 
+with st.expander(
+    "About this research tool"
+):
+    st.write(
+        """
+GroundResilience AI is a geotechnical literature-intelligence
+prototype focused equally on soil liquefaction and ground improvement.
+
+The current corpus is restricted to publications through
+December 31, 2020.
+
+The website first retrieves and ranks relevant literature locally.
+Gemini then receives only a small set of the highest-ranked abstracts
+and is instructed to synthesize only that evidence with traceable
+source-number citations.
+
+Gemini answers are capped at 300 words.
+
+If Gemini is unavailable, the application automatically falls back
+to free local evidence extraction.
+        """
+    )
+
 st.caption(
-    "Research screening only. "
-    "Site-specific engineering decisions require "
-    "qualified geotechnical professional judgment."
+    "Research screening only. Site-specific engineering decisions "
+    "require qualified geotechnical professional judgment."
 )
